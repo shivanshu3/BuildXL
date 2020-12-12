@@ -11,6 +11,7 @@ using BuildXL.Scheduler.Tracing;
 using BuildXL.ToolSupport;
 using BuildXL.Utilities;
 using Microsoft.VisualStudio.Services.Common;
+using Microsoft.VisualStudio.Services.Profile;
 
 namespace BuildXL.Execution.Analyzer
 {
@@ -112,78 +113,61 @@ namespace BuildXL.Execution.Analyzer
         {
             Console.WriteLine($"ObservedAccessAnalyzer: Starting analysis of {m_observedAccessMap.Count} observed access map entries at {DateTime.Now}.");
 
+            var jsonPips = new Newtonsoft.Json.Linq.JArray();
+            var pathTable = PipGraph.Context.PathTable;
+            var serializer = new Newtonsoft.Json.JsonSerializer();
+            serializer.Formatting = Newtonsoft.Json.Formatting.Indented;
+
             using (var outputStream = File.Create(OutputFilePath, bufferSize: 64 << 10 /* 64 KB */))
+            using (var writer = new StreamWriter(outputStream))
+            using (var jsonTextWriter = new Newtonsoft.Json.JsonTextWriter(writer))
             {
-                using (var writer = new StreamWriter(outputStream))
+                foreach (var observedAccess in m_observedAccessMap.OrderBy(kvp => PipGraph.GetPipFromPipId(kvp.Key).SemiStableHash))
                 {
-                    foreach (var observedAccess in m_observedAccessMap.OrderBy(kvp => PipGraph.GetPipFromPipId(kvp.Key).SemiStableHash))
+                    var pip = PipGraph.GetPipFromPipId(observedAccess.Key);
+
+                    if (TargetPip == null || TargetPip.Value == pip.SemiStableHash)
                     {
-                        var pip = PipGraph.GetPipFromPipId(observedAccess.Key);
-                        var pathTable = PipGraph.Context.PathTable;
+                        var jsonPip = new Newtonsoft.Json.Linq.JObject();
+                        jsonPip.Add("Description", pip.GetDescription(PipGraph.Context));
 
-                        if (TargetPip == null || TargetPip.Value == pip.SemiStableHash)
+                        var jsonExtraDeps = new Newtonsoft.Json.Linq.JArray();
+
+                        var accesses = SortPaths 
+                            ? observedAccess.Value.OrderBy(item => item.GetPath(PathTable))
+                            : (IEnumerable<ReportedFileAccess>)observedAccess.Value;
+
+                        if (pip.PipType != Pips.Operations.PipType.Process)
+                            continue;
+
+                        var extraDependencies = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+                        var processPip = (Pips.Operations.Process) pip;
+                        processPip.Dependencies
+                            .Select(file => file.Path.ToString(pathTable))
+                            .ForEach(path => extraDependencies.Add(path));
+
+                        var observedInputs = accesses
+                            .Where(access => access.RequestedAccess.HasFlag(RequestedAccess.Read))
+                            .ToList();
+
+                        foreach (var observedInput in observedInputs)
                         {
-                            writer.WriteLine("{0})", PipGraph.GetPipFromPipId(observedAccess.Key).GetDescription(PipGraph.Context));
-
-                            if (Verbose)
-                            {
-                                writer.WriteLine("    ObservedAccessByPath:{0}", observedAccess.Value.Count);
-                            }
-
-                            var accesses = SortPaths 
-                                ? observedAccess.Value.OrderBy(item => item.GetPath(PathTable))
-                                : (IEnumerable<ReportedFileAccess>)observedAccess.Value;
-
-                            if (pip.PipType != Pips.Operations.PipType.Process)
-                                continue;
-
-                            var extraDependencies = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-                            var processPip = (Pips.Operations.Process) pip;
-                            processPip.Dependencies
-                                .Select(file => file.Path.ToString(pathTable))
-                                .ForEach(path => extraDependencies.Add(path));
-
-                            if (Verbose)
-                            {
-                                writer.WriteLine("    Explicit Inputs: {0}", extraDependencies.Count);
-                                foreach (var inputFile in extraDependencies)
-                                {
-                                    writer.WriteLine("    Explicit Input = {0}", inputFile);
-                                }
-                            }
-
-                            var observedInputs = accesses
-                                .Where(access => access.RequestedAccess.HasFlag(RequestedAccess.Read))
-                                .ToList();
-
-                            if (Verbose)
-                            {
-                                writer.WriteLine("    Observed Inputs: {0}", observedInputs.Count);
-                            }
-
-                            foreach (var observedInput in observedInputs)
-                            {
-                                var accessPath = GetAccessPath(observedInput);
-
-                                if (Verbose)
-                                {
-                                    writer.WriteLine("    Observed Input = {0}", accessPath);
-                                }
-
-                                extraDependencies.Remove(accessPath);
-                            }
-
-                            writer.WriteLine("    Extra Dependencies: {0}", extraDependencies.Count);
-                            foreach (var inputFile in extraDependencies)
-                            {
-                                writer.WriteLine("    Extra Dependency = {0}", inputFile);
-                            }
-
-                            writer.WriteLine();
+                            var accessPath = GetAccessPath(observedInput);
+                            extraDependencies.Remove(accessPath);
                         }
+
+                        foreach (var inputFile in extraDependencies)
+                        {
+                            jsonExtraDeps.Add(inputFile);
+                        }
+
+                        jsonPip.Add("ExtraDeps", jsonExtraDeps);
+                        jsonPips.Add(jsonPip);
                     }
                 }
+
+                serializer.Serialize(jsonTextWriter, jsonPips);
             }
 
             return 0;
