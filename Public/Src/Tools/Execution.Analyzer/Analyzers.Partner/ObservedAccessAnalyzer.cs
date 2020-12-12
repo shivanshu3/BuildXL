@@ -10,6 +10,7 @@ using BuildXL.Processes;
 using BuildXL.Scheduler.Tracing;
 using BuildXL.ToolSupport;
 using BuildXL.Utilities;
+using Microsoft.VisualStudio.Services.Common;
 
 namespace BuildXL.Execution.Analyzer
 {
@@ -20,6 +21,7 @@ namespace BuildXL.Execution.Analyzer
             string outputFilePath = null;
             long? targetPip = null;
             bool sortPaths = true;
+            bool verbose = false;
 
             foreach (var opt in AnalyzerOptions)
             {
@@ -32,6 +34,10 @@ namespace BuildXL.Execution.Analyzer
                    opt.Name.Equals("p", StringComparison.OrdinalIgnoreCase))
                 {
                     targetPip = ParseSemistableHash(opt);
+                }
+                else if (opt.Name.Equals("v", StringComparison.OrdinalIgnoreCase))
+                {
+                    verbose = true;
                 }
                 else if (opt.Name.TrimEnd('-', '+').Equals("sortPaths", StringComparison.OrdinalIgnoreCase))
                 {
@@ -47,7 +53,8 @@ namespace BuildXL.Execution.Analyzer
             {
                 OutputFilePath = outputFilePath,
                 TargetPip = targetPip,
-                SortPaths = sortPaths
+                SortPaths = sortPaths,
+                Verbose = verbose
             };
         }
 
@@ -57,6 +64,7 @@ namespace BuildXL.Execution.Analyzer
             writer.WriteModeOption(nameof(AnalysisMode.ObservedAccess), "Generates a text file containing observed files accesses when executing pips. NOTE: Requires build with /logObservedFileAccesses.");
             writer.WriteOption("outputFile", "Required. The file where to write the results", shortName: "o");
             writer.WriteOption("pip", "Optional. The pip which file accesses will be dumped", shortName: "p");
+            writer.WriteOption("v", "Optional. Verbose output");
         }
     }
 
@@ -80,6 +88,11 @@ namespace BuildXL.Execution.Analyzer
         /// </summary>
         public bool SortPaths = true;
 
+        /// <summary>
+        /// Verbose output
+        /// </summary>
+        public bool Verbose = false;
+
         private readonly Dictionary<PipId, IReadOnlyCollection<ReportedFileAccess>> m_observedAccessMap = new Dictionary<PipId, IReadOnlyCollection<ReportedFileAccess>>();
 
         public ObservedAccessAnalyzer(AnalysisInput input)
@@ -88,13 +101,16 @@ namespace BuildXL.Execution.Analyzer
             Console.WriteLine($"ObservedAccessAnalyzer: Constructed at {DateTime.Now}.");
         }
 
+        private string GetAccessPath(ReportedFileAccess access)
+        {
+            return (access.Path ?? access.ManifestPath.ToString(PathTable)).ToCanonicalizedPath();
+        }
+
         [System.Diagnostics.CodeAnalysis.SuppressMessage("Microsoft.Reliability", "CA2000:Dispose objects before losing scope")]
         [System.Diagnostics.CodeAnalysis.SuppressMessage("Microsoft.Usage", "CA2202:DoNotDisposeObjectsMultipleTimes")]
         public override int Analyze()
         {
             Console.WriteLine($"ObservedAccessAnalyzer: Starting analysis of {m_observedAccessMap.Count} observed access map entries at {DateTime.Now}.");
-
-            int totalAccesses = 0;
 
             using (var outputStream = File.Create(OutputFilePath, bufferSize: 64 << 10 /* 64 KB */))
             {
@@ -102,18 +118,66 @@ namespace BuildXL.Execution.Analyzer
                 {
                     foreach (var observedAccess in m_observedAccessMap.OrderBy(kvp => PipGraph.GetPipFromPipId(kvp.Key).SemiStableHash))
                     {
-                        if (TargetPip == null || TargetPip.Value == PipGraph.GetPipFromPipId(observedAccess.Key).SemiStableHash)
+                        var pip = PipGraph.GetPipFromPipId(observedAccess.Key);
+                        var pathTable = PipGraph.Context.PathTable;
+
+                        if (TargetPip == null || TargetPip.Value == pip.SemiStableHash)
                         {
                             writer.WriteLine("{0})", PipGraph.GetPipFromPipId(observedAccess.Key).GetDescription(PipGraph.Context));
-                            writer.WriteLine("    ObservedAccessByPath:{0}", observedAccess.Value.Count);
+
+                            if (Verbose)
+                            {
+                                writer.WriteLine("    ObservedAccessByPath:{0}", observedAccess.Value.Count);
+                            }
+
                             var accesses = SortPaths 
                                 ? observedAccess.Value.OrderBy(item => item.GetPath(PathTable))
                                 : (IEnumerable<ReportedFileAccess>)observedAccess.Value;
-                            foreach (var access in accesses)
+
+                            if (pip.PipType != Pips.Operations.PipType.Process)
+                                continue;
+
+                            var extraDependencies = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+                            var processPip = (Pips.Operations.Process) pip;
+                            processPip.Dependencies
+                                .Select(file => file.Path.ToString(pathTable))
+                                .ForEach(path => extraDependencies.Add(path));
+
+                            if (Verbose)
                             {
-                                writer.WriteLine("    Path = {0}", (access.Path ?? access.ManifestPath.ToString(PathTable)).ToCanonicalizedPath());
-                                writer.WriteLine("    {0}", access.Describe());
-                                totalAccesses++;
+                                writer.WriteLine("    Explicit Inputs: {0}", extraDependencies.Count);
+                                foreach (var inputFile in extraDependencies)
+                                {
+                                    writer.WriteLine("    Explicit Input = {0}", inputFile);
+                                }
+                            }
+
+                            var observedInputs = accesses
+                                .Where(access => access.RequestedAccess.HasFlag(RequestedAccess.Read))
+                                .ToList();
+
+                            if (Verbose)
+                            {
+                                writer.WriteLine("    Observed Inputs: {0}", observedInputs.Count);
+                            }
+
+                            foreach (var observedInput in observedInputs)
+                            {
+                                var accessPath = GetAccessPath(observedInput);
+
+                                if (Verbose)
+                                {
+                                    writer.WriteLine("    Observed Input = {0}", accessPath);
+                                }
+
+                                extraDependencies.Remove(accessPath);
+                            }
+
+                            writer.WriteLine("    Extra Dependencies: {0}", extraDependencies.Count);
+                            foreach (var inputFile in extraDependencies)
+                            {
+                                writer.WriteLine("    Extra Dependency = {0}", inputFile);
                             }
 
                             writer.WriteLine();
@@ -121,8 +185,6 @@ namespace BuildXL.Execution.Analyzer
                     }
                 }
             }
-
-            Console.WriteLine($"ObservedAccessAnalyzer: Dumped information on {m_observedAccessMap.Count} observed access map entries and {totalAccesses} total accesses at {DateTime.Now}.");
 
             return 0;
         }
